@@ -1,0 +1,19 @@
+name = "attentionmarket-gateway"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Email handler — receives inbound emails from Cloudflare Email Routing
+send_email = [
+  { name = "SEND_EMAIL" }
+]
+
+# Secrets set via: wrangler secret put SECRET_NAME
+# SELLER_REAL_EMAIL     — the seller's actual inbox (never on-chain)
+# SELLER_GATEWAY_EMAIL  — the public MX address (matches vault.gateway_email)
+# SUI_RPC_URL           — https://fullnode.testnet.sui.io:443
+# VAULT_ID              — the AttentionVault object ID
+# PACKAGE_ID            — the deployed Move package ID
+
+[vars]
+# Non-secret config — override in wrangler.toml or via dashboard
+SUI_NETWORK = "testnet"
