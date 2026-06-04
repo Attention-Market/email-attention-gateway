@@ -70,6 +70,11 @@ import {
 
 export default {
   async email(message, env, _ctx) {
+     const maxBytes = 5 * 1024 * 1024; // 5 MiB
+    if (message.rawSize > maxBytes) {
+      message.setReject("Message too large");
+      return;
+    }
     const from    = message.from.toLowerCase().trim()
     const to      = message.to.toLowerCase().trim()
     const subject = message.headers.get('subject') || ''
