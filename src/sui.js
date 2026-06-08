@@ -6,45 +6,36 @@
 // blob — exactly what the key generation script exports via
 // subtle.exportKey('pkcs8', keyPair.privateKey).
 //
-// Client strategy (based on @mysten/sui@2.x package structure):
+// Client strategy:
 //
-//   SuiGrpcClient    (@mysten/sui/grpc)    — object fetching, dynamic fields
-//   SuiJsonRpcClient (@mysten/sui/jsonRpc) — event querying (queryEvents),
-//                                            getDynamicFieldObject
-
-import { SuiGrpcClient, GrpcWebFetchTransport } from '@mysten/sui/grpc'
+//   SuiJsonRpcClient (@mysten/sui/jsonRpc) — all on-chain reads:
+//     getObject, getDynamicFieldObject, queryEvents
+ 
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc'
-
+ 
 // ── Client factory ────────────────────────────────────────────────────────────
-
+ 
 /**
- * Create both Sui clients from the worker environment.
+ * Create the Sui JSON-RPC client from the worker environment.
  *
  * Env vars (all optional — defaults to testnet):
  *   SUI_NETWORK  — 'mainnet' | 'testnet' | 'devnet' | 'localnet'
- *   SUI_GRPC_URL — gRPC-web base URL, e.g. https://sui-mainnet.mystenlabs.com
- *   SUI_RPC_URL  — JSON-RPC endpoint (for queryEvents)
+ *   SUI_RPC_URL  — JSON-RPC endpoint override
  *
- * Returns { grpc, rpc }
+ * Returns { rpc }
  */
 export function makeClients(env) {
   const network = env.SUI_NETWORK || 'testnet'
-
-  const grpc = new SuiGrpcClient(
-    env.SUI_GRPC_URL
-      ? { network, transport: new GrpcWebFetchTransport({ baseUrl: env.SUI_GRPC_URL }) }
-      : { network }
-  )
-
+ 
   const rpc = new SuiJsonRpcClient({
     url: env.SUI_RPC_URL || getJsonRpcFullnodeUrl(network),
   })
-
-  return { grpc, rpc }
+ 
+  return { rpc }
 }
-
+ 
 // ── Hashing ───────────────────────────────────────────────────────────────────
-
+ 
 /**
  * sha256(str) → lowercase hex string.
  */
@@ -55,7 +46,7 @@ export async function sha256hex(str) {
     .map(b => b.toString(16).padStart(2, '0'))
     .join('')
 }
-
+ 
 /**
  * Normalise and hash a sender email address.
  * sha256( email.toLowerCase().trim() )
@@ -64,7 +55,7 @@ export async function sha256hex(str) {
 export async function hashEmail(email) {
   return sha256hex(email.toLowerCase().trim())
 }
-
+ 
 /**
  * Compute the payment_id for a sender/vault pair.
  * sha256( emailHash + ':' + vaultId )
@@ -74,35 +65,37 @@ export async function computePaymentId(email, vaultId) {
   const emailHash = await hashEmail(email)
   return sha256hex(`${emailHash}:${vaultId}`)
 }
-
+ 
 // ── Registry lookup ───────────────────────────────────────────────────────────
-
+ 
 /**
  * Resolve a full gateway email (e.g. "alice@attention.email") to a vault ID
  * by querying the Registry's gateway_emails Table<String, ID> dynamic field.
  * Returns the vault ID string (0x-prefixed), or null if not found.
  */
-export async function vaultIdByGatewayEmail(grpc, registryId, gatewayEmail) {
-  if (!registryId) return null
-  try {
-    const result = await grpc.getDynamicField({
-      parentId: registryId,
-      name: {
-        type: '0x1::string::String',
-        bcs:  stringToBcs(gatewayEmail),
-      },
-    })
-    const valueBcs = result?.dynamicField?.value?.bcs
-    if (!valueBcs || valueBcs.length === 0) return null
-    return '0x' + bytesToHex(valueBcs)
-  } catch (err) {
-    console.error('[sui] vaultIdByGatewayEmail error:', err.message)
-    return null
-  }
+export async function vaultIdByGatewayEmail(rpc, registryId, gatewayEmail) {
+  const regObj = await rpc.getObject({
+    id:      registryId,
+    options: { showContent: true },
+  })
+ 
+  const tableId = regObj.data?.content?.fields?.gateway_emails?.fields?.id?.id
+  if (!tableId) return null
+ 
+  const field = await rpc.getDynamicFieldObject({
+    parentId: tableId,
+    name: {
+      type:  '0x1::string::String',
+      value: gatewayEmail,
+    },
+  })
+ 
+  const vaultId = field.data?.content?.fields?.value
+  return vaultId ?? null
 }
-
+ 
 // ── Vault object ──────────────────────────────────────────────────────────────
-
+ 
 /**
  * Fetch vault content fields via JSON-RPC (returns parsed field map).
  * Used when structured field access is needed (encrypted email blobs, tables).
@@ -120,7 +113,7 @@ export async function fetchVaultFieldsRpc(rpc, vaultId) {
     return null
   }
 }
-
+ 
 /**
  * Pull the three encrypted-email blobs from a vault fields object.
  * Returns them as Base64 strings ready for decryptSellerEmail().
@@ -139,7 +132,7 @@ export function extractEncryptedEmailPayload(vaultFields) {
     ciphertext:         bytesToBase64(vaultFields.encrypted_email_ciphertext),
   }
 }
-
+ 
 // ── In-process ECDH + AES-GCM decryption ─────────────────────────────────────
 //
 // Matches the scheme in encrypt.js (frontend):
@@ -152,7 +145,7 @@ export function extractEncryptedEmailPayload(vaultFields) {
 // which is stored in the PRIVATE_KEY env var as a base64-encoded PKCS#8 blob —
 // exactly what `subtle.exportKey('pkcs8', keyPair.privateKey)` produces from
 // the key generation script. We import it directly with no transformation.
-
+ 
 /**
  * Import the gateway's static P-256 private key from the PRIVATE_KEY env var.
  * The env var holds a base64-encoded PKCS#8 export of the private key,
@@ -170,7 +163,7 @@ async function importPrivateKey(privateKeyBase64) {
     ['deriveKey']
   )
 }
-
+ 
 /**
  * Decrypt the seller's real email address from the on-chain encrypted payload.
  *
@@ -189,10 +182,10 @@ export async function decryptSellerEmail(env, payload) {
   }
   try {
     const { ephemeralPublicKey, iv, ciphertext } = payload
-
+ 
     // 1. Import the gateway static private key
     const privateKey = await importPrivateKey(env.PRIVATE_KEY)
-
+ 
     // 2. Import the ephemeral public key that was stored on-chain
     const ephemeralPubKey = await crypto.subtle.importKey(
       'raw',
@@ -201,7 +194,7 @@ export async function decryptSellerEmail(env, payload) {
       false,
       []
     )
-
+ 
     // 3. Re-derive the AES-256-GCM key via ECDH (same shared secret as encryption)
     const aesKey = await crypto.subtle.deriveKey(
       { name: 'ECDH', public: ephemeralPubKey },
@@ -210,23 +203,23 @@ export async function decryptSellerEmail(env, payload) {
       false,
       ['decrypt']
     )
-
+ 
     // 4. Decrypt
     const plaintext = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: base64ToBytes(iv) },
       aesKey,
       base64ToBytes(ciphertext)
     )
-
+ 
     return new TextDecoder().decode(plaintext)
   } catch (err) {
     console.error('[decrypt] Decryption failed:', err.message ?? err)
     return null
   }
 }
-
+ 
 // ── Dynamic field helpers ─────────────────────────────────────────────────────
-
+ 
 /**
  * Check whether a vector<u8> key exists in a Move Table dynamic field.
  * Returns true if the entry is present.
@@ -244,7 +237,7 @@ async function tableHasKey(rpc, tableId, hexKey) {
     return false
   }
 }
-
+ 
 /**
  * Check whether a conversation thread is closed on-chain.
  * vault.closed_threads[payment_id] present → closed.
@@ -253,9 +246,9 @@ export async function isThreadClosed(rpc, vaultFields, paymentIdHex) {
   const tableId = vaultFields?.closed_threads?.fields?.id?.id
   return tableHasKey(rpc, tableId, paymentIdHex)
 }
-
+ 
 // ── SlotWon event index ───────────────────────────────────────────────────────
-
+ 
 /**
  * Fetch all SlotWon events for a vault and return a lookup map:
  *   paymentId (hex) → { senderEmailHash: string, bidderAddress: string }
@@ -290,9 +283,9 @@ export async function fetchSlotWonMap(rpc, packageId, vaultId) {
   }
   return map
 }
-
+ 
 // ── Utilities ─────────────────────────────────────────────────────────────────
-
+ 
 /** Base64 string → Uint8Array */
 function base64ToBytes(b64) {
   const binary = atob(b64)
@@ -300,7 +293,7 @@ function base64ToBytes(b64) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
   return bytes
 }
-
+ 
 /** Hex string → number array (for Move vector<u8> dynamic field keys) */
 export function hexToNumberArray(hex) {
   const bytes = []
@@ -308,7 +301,7 @@ export function hexToNumberArray(hex) {
     bytes.push(parseInt(hex.slice(i, i + 2), 16))
   return bytes
 }
-
+ 
 /** Byte array or hex string → lowercase hex string */
 export function bytesToHex(bytes) {
   if (typeof bytes === 'string') return bytes
@@ -316,7 +309,7 @@ export function bytesToHex(bytes) {
     .map(b => b.toString(16).padStart(2, '0'))
     .join('')
 }
-
+ 
 /**
  * Encode a JS string as BCS bytes for 0x1::string::String.
  * BCS String = ULEB128 length prefix + UTF-8 bytes.
@@ -336,7 +329,7 @@ function stringToBcs(str) {
   result.set(utf8, lenBytes.length)
   return result
 }
-
+ 
 /**
  * Convert a Sui vector<u8> field value to a Base64 string.
  * JSON-RPC returns these as number arrays; hex strings are also handled.
