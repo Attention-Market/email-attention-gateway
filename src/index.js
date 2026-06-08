@@ -65,8 +65,7 @@
 //   SUI_NETWORK           'mainnet' | 'testnet' | 'devnet' (default: testnet)
 //   SUI_GRPC_URL          gRPC-web endpoint (optional)
 //   SUI_RPC_URL           JSON-RPC endpoint (optional)
-//   DECRYPT_WORKER_URL    URL of the decrypt.js Cloudflare Worker
-//   DECRYPT_WORKER_SECRET Shared secret header for the decrypt worker
+//   PRIVATE_KEY           Base64-encoded raw P-256 private key (32 bytes) for email decryption
 //   GATEWAY_DOMAIN        e.g. "attention.email"   (default: "attention.email")
 //   REPLY_SUBDOMAIN       e.g. "reply.attention.email" (default: "reply.<GATEWAY_DOMAIN>")
 
@@ -94,18 +93,20 @@ import {
 
 export default {
   async email(message, env, _ctx) {
-    const maxBytes = 5 * 1024 * 1024; // 5 MiB
-    if (message.rawSize > maxBytes) {
-      message.setReject("Message too large");
-      return;
-    }
-    
     const from    = message.from.toLowerCase().trim()
     const to      = message.to.toLowerCase().trim()
     const subject = message.headers.get('subject') || ''
     const headers = message.headers
 
     console.log(`[gateway] ${from} → ${to} | "${subject}"`)
+
+    // Reject oversized messages before doing any Sui RPC work
+    const MAX_BYTES = 5 * 1024 * 1024 // 5 MiB
+    if (message.rawSize > MAX_BYTES) {
+      console.log(`[gateway] DROP — message too large (${message.rawSize} bytes) from ${from}`)
+      message.setReject("Message too large")
+      return
+    }
 
     const gatewayDomain  = (env.GATEWAY_DOMAIN || 'attention.email').toLowerCase()
     const replySubdomain = (env.REPLY_SUBDOMAIN || `reply.${gatewayDomain}`).toLowerCase()
