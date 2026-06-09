@@ -331,29 +331,27 @@ async function sendWithFooter(message, toAddress, subject, replyTo, footer, env,
     const rawBody  = await new Response(message.raw).text()
     const bodyText = extractTextBody(rawBody)
 
-    // Build extra headers to preserve threading and hide real addresses
-    const extraHeaders = {
-      'X-Original-From': message.from,
-    }
-    if (replyTo) {
-      extraHeaders['Reply-To'] = `<${replyTo}>`
-    }
-    // Carry threading headers through so mail clients group the conversation
+    // Only X-* headers are allowed by Cloudflare's send API.
+    // Reply-To is a top-level field; threading headers are X-* prefixed.
+    const extraHeaders = { 'X-Original-From': message.from }
     const inReplyTo  = message.headers.get('in-reply-to')
     const references = message.headers.get('references')
     const messageId  = message.headers.get('message-id')
-    if (inReplyTo)  extraHeaders['In-Reply-To']  = inReplyTo
-    if (references) extraHeaders['References']   = references
+    if (inReplyTo)  extraHeaders['X-In-Reply-To']  = inReplyTo
+    if (references) extraHeaders['X-References']   = references
     if (messageId)  extraHeaders['X-Original-Message-Id'] = messageId
 
-    await env.EMAIL.send({
+    const payload = {
       to:      toAddress,
       from:    fromAddress,
       subject,
       text:    bodyText + '\n\n' + footer,
       html:    buildHtml(bodyText, footer),
       headers: extraHeaders,
-    })
+    }
+    if (replyTo) payload.replyTo = replyTo
+
+    await env.EMAIL.send(payload)
 
     console.log(`[gateway] Sent to ${toAddress}`)
   } catch (err) {
