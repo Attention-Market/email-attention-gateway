@@ -7,10 +7,6 @@ compatibility_date = "2024-01-01"
 name = "EMAIL"
 remote = true
 
-# Email Routing — inbound (catch-all handler)
-[[email]]
-name = "EMAIL_HANDLER"
-
 [[kv_namespaces]]
 binding = "ALIASES"
 id = "33127bdeeae1460281a273cfc4af9a15"
