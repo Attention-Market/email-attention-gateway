@@ -38,8 +38,7 @@
 //   6. Verify [attn:SIG] Ed25519 signature against on-chain bidder address.
 //   7. Confirm thread is not closed on-chain.
 //   8. Decrypt seller's real email from vault encrypted blob.
-//   9. Forward to seller. Set Reply-To: <paymentId>@reply.attention.email
-//      and append info footer (paymentId, vaultId) via X-AttentionMarket header.
+//   9. Send to seller. Set Reply-To: <paymentId>@reply.attention.email
 //
 // ── Outbound (seller → winner) ────────────────────────────────────────────────
 //
@@ -55,7 +54,7 @@
 //   4. Decrypt vault's seller email, confirm From: matches (anti-spoof).
 //   5. Verify [attn:SIG] signature (seller proves wallet ownership).
 //   6. Confirm thread not closed on-chain.
-//   7. Forward to winner, appending paymentId footer.
+//   7. Send to winner, appending paymentId footer.
 //      Seller's real address is never disclosed to the winner.
 //
 // ── Env vars ──────────────────────────────────────────────────────────────────
@@ -63,11 +62,11 @@
 //   REGISTRY_ID           Sui object ID of the shared Registry
 //   PACKAGE_ID            Sui package ID of the attention_market module
 //   SUI_NETWORK           'mainnet' | 'testnet' | 'devnet' (default: testnet)
-//   SUI_GRPC_URL          gRPC-web endpoint (optional)
 //   SUI_RPC_URL           JSON-RPC endpoint (optional)
 //   PRIVATE_KEY           Base64-encoded raw P-256 private key (32 bytes) for email decryption
 //   GATEWAY_DOMAIN        e.g. "attention.email"   (default: "attention.email")
 //   REPLY_SUBDOMAIN       e.g. "reply.attention.email" (default: "reply.<GATEWAY_DOMAIN>")
+//   GATEWAY_FROM          Sender address for outgoing mail (default: noreply@<GATEWAY_DOMAIN>)
 
 import {
   makeClients,
@@ -112,13 +111,9 @@ export default {
     const replySubdomain = (env.REPLY_SUBDOMAIN || `reply.${gatewayDomain}`).toLowerCase()
 
     // ── Route: seller reply ───────────────────────────────────────────────────
-    //
-    // Detected by standard RFC 5322 threading headers (In-Reply-To / References).
-    // The To: address is <paymentId>@reply.attention.email — set by our Reply-To
-    // when we forwarded the original inbound mail to the seller.
     if (isReplyMessage(headers) && to.endsWith(`@${replySubdomain}`)) {
-      const { grpc, rpc } = makeClients(env)
-      await handleSellerReply({ message, from, to, subject, grpc, rpc, env, gatewayDomain, replySubdomain })
+      const { rpc } = makeClients(env)
+      await handleSellerReply({ message, from, to, subject, rpc, env, gatewayDomain, replySubdomain })
       return
     }
 
@@ -130,8 +125,8 @@ export default {
         message.setReject('Loop detected')
         return
       }
-      const { grpc, rpc } = makeClients(env)
-      await handleInbound({ message, from, to, subject, grpc, rpc, env, gatewayDomain, replySubdomain })
+      const { rpc } = makeClients(env)
+      await handleInbound({ message, from, to, subject, rpc, env, gatewayDomain, replySubdomain })
       return
     }
 
@@ -142,7 +137,7 @@ export default {
 
 // ── Inbound: winner → seller ──────────────────────────────────────────────────
 
-async function handleInbound({ message, from, to, subject, grpc, rpc, env, gatewayDomain, replySubdomain }) {
+async function handleInbound({ message, from, to, subject, rpc, env, gatewayDomain, replySubdomain }) {
 
   // 1. Must carry [attn:] tag
   if (!extractAttnTag(subject)) {
@@ -155,7 +150,7 @@ async function handleInbound({ message, from, to, subject, grpc, rpc, env, gatew
   const localPart    = to.split('@')[0]
   const gatewayEmail = `${localPart}@${gatewayDomain}`
 
-  const vaultId = await vaultIdByGatewayEmail(grpc, env.REGISTRY_ID, gatewayEmail)
+  const vaultId = await vaultIdByGatewayEmail(rpc, env.REGISTRY_ID, gatewayEmail)
   if (!vaultId) {
     console.log(`[gateway] DROP inbound — no vault for ${gatewayEmail}`)
     message.setReject('Unknown gateway address')
@@ -218,52 +213,53 @@ async function handleInbound({ message, from, to, subject, grpc, rpc, env, gatew
     return
   }
 
-  // 10. Forward to seller
-  //     Reply-To is set to <paymentId>@reply.attention.email so that when the
-  //     seller hits Reply their client addresses the outbound mail there.
-  //     We use that address in handleSellerReply() to recover the paymentId
-  //     without relying on any subject-line convention.
-  // Encode both paymentId and vaultId in the reply address so handleSellerReply
-  // can recover the vault without a registry scan.
-  // Format: <paymentId>.<vaultId-without-0x>@reply.attention.email
-  const vaultIdHex = vaultId.startsWith('0x') ? vaultId.slice(2) : vaultId
-  const replyTo = `${paymentId}.${vaultIdHex}@${replySubdomain}`
-  const footer  = buildInboundFooter({ paymentId, vaultId, senderEmail: from })
-
-  // Store winner's plaintext email in KV so handleSellerReply can recover it.
-  // TTL is set to 90 days — long enough for any reasonable conversation window.
-  // The key is paymentId which is already a commitment to the email address,
-  // so storing the plaintext here only adds resolution capability, not new exposure.
+  // 10. Store winner → paymentId mapping in KV for reply routing
   if (env.REPLY_KV) {
-    await env.REPLY_KV.put(`winner:${paymentId}`, from, { expirationTtl: 60 * 60 * 24 * 90 })
+    await env.REPLY_KV.put(
+      `winner:${paymentId}`,
+      JSON.stringify({ email: from, vaultId }),
+      { expirationTtl: 60 * 60 * 24 * 90 }
+    )
   }
 
-  console.log(`[gateway] ✓ Inbound verified from ${from} — forwarding to seller, reply-to ${replyTo}`)
-  await forwardWithFooter(message, sellerRealEmail, cleanSubject(subject), replyTo, footer)
+  // 11. Send to seller
+  const replyTo = `${paymentId}@${replySubdomain}`
+  const footer  = buildInboundFooter({ paymentId, vaultId, senderEmail: from })
+
+  console.log(`[gateway] ✓ Inbound verified from ${from} — sending to seller, reply-to ${replyTo}`)
+  // Use the address the winner wrote to (e.g. alice@attention.email) as the From —
+  // this matches the wildcard address authorised for sending on this domain.
+  await sendWithFooter(message, sellerRealEmail, cleanSubject(subject), replyTo, footer, env, to)
 }
 
 // ── Outbound: seller → winner ─────────────────────────────────────────────────
 
-async function handleSellerReply({ message, from, to, subject, grpc, rpc, env, gatewayDomain, replySubdomain }) {
+async function handleSellerReply({ message, from, to, subject, rpc, env, gatewayDomain, replySubdomain }) {
 
   // 1. Parse paymentId + vaultId from the reply address
-  //    Format: <paymentId>.<vaultId>@reply.attention.email  (both 64-char hex)
-  //    This address was set as Reply-To when the original inbound mail was
-  //    forwarded to the seller, so the mail client populates it automatically.
   const parsedReply = parseReplyAddress(to, replySubdomain)
   if (!parsedReply) {
     console.log(`[gateway] DROP outbound — invalid reply address: ${to}`)
     message.setReject('Invalid reply address')
     return
   }
-  const { paymentId, vaultId } = parsedReply
+  const { paymentId } = parsedReply
 
-  // 2. Must carry [attn:] tag — seller proves wallet ownership on every reply
+  // 2. Must carry [attn:] tag
   if (!extractAttnTag(subject)) {
     console.log(`[gateway] DROP outbound — no [attn:] tag from ${from}`)
     message.setReject('Missing attention token on reply')
     return
   }
+
+  // 3. Recover vaultId + winnerEmail from KV
+  const kvRecord = await env.REPLY_KV?.get(`winner:${paymentId}`)
+  if (!kvRecord) {
+    console.log(`[gateway] DROP outbound — no KV record for ${paymentId.slice(0, 12)}…`)
+    message.setReject('Cannot resolve winner address')
+    return
+  }
+  const { email: winnerEmail, vaultId } = JSON.parse(kvRecord)
 
   // 4. Fetch vault fields
   const vaultFields = await fetchVaultFieldsRpc(rpc, vaultId)
@@ -289,10 +285,7 @@ async function handleSellerReply({ message, from, to, subject, grpc, rpc, env, g
     return
   }
 
-  // 6. Verify [attn:SIG] — seller signs "AttentionMarket:<vaultId>:<paymentId>"
-  //    This proves they hold the wallet that registered the vault.
-  //    We skip address-matching (expectedAddress = null) because vault ownership
-  //    is already proven by the From: ↔ decrypted email check above.
+  // 6. Verify [attn:SIG]
   const signMessage    = buildSignMessage(vaultId, paymentId)
   const { ok, reason } = await verifyAttentionToken(subject, signMessage, null)
 
@@ -310,7 +303,7 @@ async function handleSellerReply({ message, from, to, subject, grpc, rpc, env, g
     return
   }
 
-  // 8. Recover winner's email address from on-chain SlotWon events
+  // 8. Confirm SlotWon record still exists on-chain
   const slotMap    = await fetchSlotWonMap(rpc, env.PACKAGE_ID, vaultId)
   const slotRecord = slotMap[paymentId]
 
@@ -320,73 +313,106 @@ async function handleSellerReply({ message, from, to, subject, grpc, rpc, env, g
     return
   }
 
-  // SlotWon stores sender_email_hash not the plaintext address. The winner's
-  // real address is not stored on-chain (privacy model). We need to recover it
-  // from our own forwarding record.
-  //
-  // Since we never stored the winner's plaintext address server-side either,
-  // the winner's address must be sourced from the original email the seller
-  // received — which we included in the inbound footer as "Sender: <email>".
-  // The seller's mail client includes the original email body in the reply,
-  // so it is present in message.raw. Parsing MIME here is complex.
-  //
-  // Practical solution: also encode the winner's email hash in the reply
-  // address, and maintain a short-lived KV mapping
-  //   paymentId → winner plaintext email
-  // populated at forward time and consumed here.
-  //
-  // For now we use Cloudflare KV (env.REPLY_KV) as the store.
-  const winnerEmail = await env.REPLY_KV?.get(`winner:${paymentId}`)
-  if (!winnerEmail) {
-    console.log(`[gateway] DROP outbound — no winner address on file for ${paymentId.slice(0, 12)}…`)
-    message.setReject('Cannot resolve winner address')
-    return
-  }
-
-  // 9. Forward to winner — seller's real address is never disclosed
+  // 9. Send to winner
   const footer = buildOutboundFooter({ paymentId, vaultId })
   console.log(`[gateway] ✓ Seller reply → ${winnerEmail}`)
-  await forwardWithFooter(message, winnerEmail, cleanSubject(subject), null, footer)
+  // Use the reply address the seller responded to as the From —
+  // it is already authorised under the reply subdomain wildcard.
+  const outboundFrom = `${paymentId}@${replySubdomain}`
+  await sendWithFooter(message, winnerEmail, cleanSubject(subject), null, footer, env, outboundFrom)
 }
 
-// ── Forward helper ────────────────────────────────────────────────────────────
+// ── Send helper ───────────────────────────────────────────────────────────────
+
+async function sendWithFooter(message, toAddress, subject, replyTo, footer, env, fromAddress) {
+  try {
+
+    // Read and decode the raw message body
+    const rawBody  = await new Response(message.raw).text()
+    const bodyText = extractTextBody(rawBody)
+
+    // Build extra headers to preserve threading and hide real addresses
+    const extraHeaders = {
+      'X-Original-From': message.from,
+    }
+    if (replyTo) {
+      extraHeaders['Reply-To'] = `<${replyTo}>`
+    }
+    // Carry threading headers through so mail clients group the conversation
+    const inReplyTo  = message.headers.get('in-reply-to')
+    const references = message.headers.get('references')
+    const messageId  = message.headers.get('message-id')
+    if (inReplyTo)  extraHeaders['In-Reply-To']  = inReplyTo
+    if (references) extraHeaders['References']   = references
+    if (messageId)  extraHeaders['X-Original-Message-Id'] = messageId
+
+    await env.EMAIL.send({
+      to:      toAddress,
+      from:    fromAddress,
+      subject,
+      text:    bodyText + '\n\n' + footer,
+      html:    buildHtml(bodyText, footer),
+      headers: extraHeaders,
+    })
+
+    console.log(`[gateway] Sent to ${toAddress}`)
+  } catch (err) {
+    console.error('[gateway] Send failed:', err)
+    message.setReject('Send failed')
+  }
+}
+
+// ── Body helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Forward the message to toAddress with updated subject and optional Reply-To.
- * The info footer is passed in X-AttentionMarket (body mutation not available
- * in the native CF email Worker API without postal-mime rewriting).
+ * Extracts the plain-text portion from a raw RFC 5322 message.
+ * For multipart messages it returns the first text/plain part.
+ * Falls back to everything after the header block.
  */
-async function forwardWithFooter(message, toAddress, subject, replyTo, footer) {
-  try {
-    const headersInit = { 'Subject': subject, 'X-AttentionMarket': footer }
-    if (replyTo) headersInit['Reply-To'] = replyTo
-    await message.forward(toAddress, new Headers(headersInit))
-    console.log(`[gateway] Forwarded to ${toAddress}`)
-  } catch (err) {
-    console.error('[gateway] Forward failed:', err)
-    message.setReject('Forward failed')
+function extractTextBody(raw) {
+  // Split headers from body on the first blank line
+  const blankLine = raw.indexOf('\r\n\r\n')
+  const body = blankLine >= 0 ? raw.slice(blankLine + 4) : raw
+
+  // Detect multipart boundary
+  const boundaryMatch = raw.match(/Content-Type:\s*multipart\/[^;]+;\s*boundary="?([^"\r\n]+)"?/i)
+  if (boundaryMatch) {
+    const boundary = '--' + boundaryMatch[1].trim()
+    const parts = body.split(boundary)
+    for (const part of parts) {
+      if (/Content-Type:\s*text\/plain/i.test(part)) {
+        const partBlank = part.indexOf('\r\n\r\n')
+        return partBlank >= 0
+          ? part.slice(partBlank + 4).replace(/--$/, '').trim()
+          : part.trim()
+      }
+    }
   }
+
+  return body.trim()
+}
+
+/** Wraps plain-text body + footer in minimal HTML. */
+function buildHtml(bodyText, footer) {
+  const esc = s =>
+    s.replace(/&/g, '&amp;')
+     .replace(/</g, '&lt;')
+     .replace(/>/g, '&gt;')
+     .replace(/\n/g, '<br>\n')
+
+  return `<!DOCTYPE html><html><body>
+<div style="font-family:sans-serif;font-size:14px;line-height:1.6">${esc(bodyText)}</div>
+<hr style="margin:24px 0;border:none;border-top:1px solid #ddd">
+<pre style="font-size:12px;color:#888;white-space:pre-wrap">${esc(footer)}</pre>
+</body></html>`
 }
 
 // ── Reply address encoding / decoding ────────────────────────────────────────
 
-/**
- * Build the Reply-To address for an inbound forward.
- * Format: <paymentId>.<vaultId>@reply.attention.email
- * Both are 64-char hex strings, joined by a dot — safe as an email local-part.
- *
- * Exported so inbound handler can call it, and tests can verify round-trips.
- */
 export function buildReplyAddress(paymentId, vaultId, replySubdomain) {
   return `${paymentId}.${vaultId}@${replySubdomain}`
 }
 
-/**
- * Parse a reply address of the form <paymentId>.<vaultId>@reply.attention.email
- * (both segments are 64-char lowercase hex — safe as an email local-part).
- * Returns { paymentId, vaultId } or null if format doesn't match.
- * vaultId is returned 0x-prefixed for use as a Sui object ID.
- */
 function parseReplyAddress(to, replySubdomain) {
   const lower = to.toLowerCase().trim()
   if (!lower.endsWith(`@${replySubdomain}`)) return null
@@ -402,10 +428,6 @@ function parseReplyAddress(to, replySubdomain) {
 
 // ── Footer builders ───────────────────────────────────────────────────────────
 
-/**
- * Footer sent to the seller on inbound email.
- * Includes everything needed to call close_conversation() on-chain.
- */
 function buildInboundFooter({ paymentId, vaultId, senderEmail }) {
   return [
     '--- AttentionMarket ---',
@@ -417,9 +439,6 @@ function buildInboundFooter({ paymentId, vaultId, senderEmail }) {
   ].join('\n')
 }
 
-/**
- * Footer sent to the winner on outbound email.
- */
 function buildOutboundFooter({ paymentId, vaultId }) {
   return [
     '--- AttentionMarket ---',
