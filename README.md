@@ -5,38 +5,61 @@ No server, no process to run, no SMTP port to expose.
 
 ## How it works
 
-Cloudflare Email Routing receives emails at your gateway address
-(e.g. `alice@attentionmarket.xyz`) and triggers this Worker.
+Cloudflare Email Routing receives emails at your gateway domain (`attention.email`)
+and triggers this Worker. Every registered seller gets a unique address like
+`alice@attention.email`, resolved from the on-chain Registry at routing time.
+
+Reply routing uses a `reply.attention.email` subdomain with a catch-all rule.
+The seller never sees the winner's real address, and the winner never sees the seller's.
+
+---
 
 ### Inbound (winner → seller)
 
 ```
-winner@example.com  →  alice@attentionmarket.xyz
+winner@example.com  →  alice@attention.email
 Subject: Hey Alice! [attn:BASE64SIG]
 ```
 
 Worker checks:
-1. `[attn:SIG]` present in subject
-2. Fetches vault from Sui RPC
-3. `sha256(from)` matches on-chain `sender_email_hash` from `SlotWon` event
-4. Thread not closed (`vault.closed_threads[payment_id]`)
-5. Ed25519 signature valid — signer is the on-chain `bidder` address
-6. Forwards to `SELLER_REAL_EMAIL` (env secret, never on-chain), stripping `[attn:]`
 
-### Outbound (seller replies)
+1. `[attn:SIG]` present in subject
+2. Resolves `alice` → vaultId via on-chain Registry
+3. Fetches vault fields from Sui RPC
+4. Computes `paymentId = sha256(sha256(from) + vaultId)`
+5. Looks up `SlotWon` event — confirms winning bid exists for this paymentId
+6. `sha256(from)` matches on-chain `sender_email_hash`
+7. Ed25519 signature valid — signer matches on-chain `bidder` address
+8. Thread not closed on-chain (`vault.closed_threads[paymentId]`)
+9. Rate limit: max 1 email per hour (per winner per vault)
+10. Decrypts seller's real email from on-chain encrypted blob
+11. Forwards to seller. Sets `Reply-To: <paymentId>@reply.attention.email`
+
+---
+
+### Outbound (seller → winner)
+
+Seller hits **Reply** in their mail client. Their client automatically addresses
+the email to the `Reply-To` set in step 11 above.
 
 ```
-real_inbox@gmail.com  →  alice@attentionmarket.xyz
-Subject: Re: your question [reply-to:winner@example.com]
+seller@example.com  →  <paymentId>@reply.attention.email
+Subject: Re: Hey Alice! [attn:BASE64SIG]
+In-Reply-To: <original-message-id>
 ```
 
 Worker checks:
-1. `From:` matches `SELLER_REAL_EMAIL` exactly
-2. `[reply-to:email]` present in subject
-3. Thread not closed on Sui
-4. Forwards to winner's address, stripping `[reply-to:]`
 
-**Emails without the correct tag are silently dropped.** No bounce, no error.
+1. `In-Reply-To` or `References` header present → outbound flow
+2. Extracts `paymentId` from `To:` local-part
+3. Looks up winner address + vaultId from KV (written during inbound)
+4. Decrypts vault's stored seller email — confirms `From:` matches (anti-spoof)
+5. Thread not closed on-chain
+6. `SlotWon` record still exists on-chain
+7. Rate limit: max 1 reply per hour (per seller per winner)
+8. Forwards to winner from `alice@attention.email`
+
+**Emails failing any check are rejected with an SMTP error. No silent drops.**
 
 ---
 
@@ -49,56 +72,63 @@ npm install
 npx wrangler login
 ```
 
-### 2. Set secrets
+### 2. Create KV namespace
 
 ```bash
-wrangler secret put SELLER_REAL_EMAIL      # your real inbox — never on-chain
-wrangler secret put SELLER_GATEWAY_EMAIL   # public MX address e.g. alice@attentionmarket.xyz
-wrangler secret put VAULT_ID               # AttentionVault object ID from deploy
-wrangler secret put PACKAGE_ID             # Move package ID from deploy
-wrangler secret put SUI_RPC_URL            # https://fullnode.testnet.sui.io:443
+npx wrangler kv namespace create ALIASES
 ```
 
-### 3. Configure Cloudflare Email Routing
+Copy the returned `id` into `wrangler.toml`:
 
-In your Cloudflare dashboard:
-- **Email → Email Routing → Routing Rules**
-- Add rule: emails to `alice@yourdomain.com` → **Send to Worker** → `attentionmarket-gateway`
+```toml
+[[kv_namespaces]]
+binding = "ALIASES"
+id = "your-namespace-id-here"
+```
 
-### 4. Deploy
+### 3. Set secrets
+
+```bash
+wrangler secret put PRIVATE_KEY       # Base64-encoded P-256 private key for email decryption
+wrangler secret put REGISTRY_ID       # Sui object ID of the shared Registry
+wrangler secret put PACKAGE_ID        # Deployed Move package ID
+wrangler secret put SUI_RPC_URL       # https://fullnode.testnet.sui.io:443
+```
+
+### 4. Configure Cloudflare Email Routing
+
+In your Cloudflare dashboard under **Email → Email Routing → Routing Rules**:
+
+- **Main domain** (`attention.email`): catch-all → Send to Worker → `attentionmarket-gateway`
+- **Reply subdomain** (`reply.attention.email`): catch-all → Send to Worker → `attentionmarket-gateway`
+
+The catch-all on the reply subdomain is important — it prevents mail clients
+(e.g. ProtonMail) from warning that the reply address doesn't exist.
+
+### 5. Deploy
 
 ```bash
 npm run deploy
 ```
 
-### 5. Test inbound
+### 6. Test inbound
 
-Send an email to your gateway address **without** an `[attn:]` tag.
-It should be silently rejected.
+Send an email to a gateway address **without** an `[attn:]` tag — it should be rejected.
 
-Then win a slot on the marketplace, get your `[attn:SIG]`, and send:
+Then win a slot on the marketplace, generate your `[attn:SIG]`, and send:
+
 ```
-To: alice@attentionmarket.xyz
+To: alice@attention.email
 Subject: Hello! [attn:YOUR_SIGNATURE_HERE]
 ```
 
 ---
 
-## Seller reply workflow
-
-To reply to a winner without revealing your real email:
-
-1. Reply from your real inbox **to the gateway address** (not directly to the winner)
-2. Put the winner's address in the subject: `Re: their message [reply-to:winner@example.com]`
-3. The gateway forwards it — the winner sees it came from the gateway address
-
----
-
 ## Closing a conversation
 
-Call `close_conversation(vault, cap, payment_id)` on the smart contract.
-The gateway checks `vault.closed_threads[payment_id]` on every email
-and drops anything from that thread in both directions.
+Call `close_conversation(vaultId, paymentId)` on the smart contract.
+The gateway checks `vault.closed_threads[paymentId]` on every email
+and rejects anything from that thread in both directions.
 
 ---
 
@@ -106,12 +136,18 @@ and drops anything from that thread in both directions.
 
 | Secret | Description |
 |--------|-------------|
-| `SELLER_REAL_EMAIL` | Your actual inbox. Never on-chain. Worker reads this to forward inbound. |
-| `SELLER_GATEWAY_EMAIL` | Public MX address. Stored on-chain as `vault.gateway_email`. |
-| `VAULT_ID` | `AttentionVault` object ID on Sui. |
-| `PACKAGE_ID` | Deployed Move package ID. |
+| `PRIVATE_KEY` | Base64-encoded P-256 private key (32 bytes) for decrypting seller emails stored on-chain. |
+| `REGISTRY_ID` | Sui object ID of the shared Registry mapping gateway addresses to vaults. |
+| `PACKAGE_ID` | Deployed Move package ID for querying `SlotWon` events. |
 | `SUI_RPC_URL` | Sui fullnode RPC endpoint. |
 
 | Var (non-secret) | Description |
 |-----------------|-------------|
-| `SUI_NETWORK` | `testnet` or `mainnet` (informational only). |
+| `SUI_NETWORK` | `testnet`, `mainnet`, or `devnet`. Default: `testnet`. |
+| `GATEWAY_DOMAIN` | Primary gateway domain. Default: `attention.email`. |
+| `REPLY_SUBDOMAIN` | Reply routing subdomain. Default: `reply.<GATEWAY_DOMAIN>`. |
+
+| Binding | Description |
+|---------|-------------|
+| `ALIASES` | KV namespace. Stores winner routing records and rate limit keys. |
+| `EMAIL` | Send Email binding for outbound delivery. |
