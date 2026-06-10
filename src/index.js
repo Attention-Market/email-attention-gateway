@@ -214,10 +214,10 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
   }
 
   // 10. Store winner → paymentId mapping in KV for reply routing
-  if (env.REPLY_KV) {
-    await env.REPLY_KV.put(
+  if (env.ALIASES) {
+    await env.ALIASES.put(
       `winner:${paymentId}`,
-      JSON.stringify({ email: from, vaultId }),
+      JSON.stringify({ email: from, vaultId,subject: subject }),
       { expirationTtl: 60 * 60 * 24 * 90 }
     )
   }
@@ -229,7 +229,7 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
   console.log(`[gateway] ✓ Inbound verified from ${from} — sending to seller, reply-to ${replyTo}`)
   // Use the address the winner wrote to (e.g. alice@attention.email) as the From —
   // this matches the wildcard address authorised for sending on this domain.
-  await sendWithFooter(message, sellerRealEmail, cleanSubject(subject), replyTo, footer, env, to)
+  await sendWithFooter(message, sellerRealEmail, subject, replyTo, footer, env, to)
 }
 
 // ── Outbound: seller → winner ─────────────────────────────────────────────────
@@ -245,15 +245,8 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
   }
   const { paymentId } = parsedReply
 
-  // 2. Must carry [attn:] tag
-  if (!extractAttnTag(subject)) {
-    console.log(`[gateway] DROP outbound — no [attn:] tag from ${from}`)
-    message.setReject('Missing attention token on reply')
-    return
-  }
-
   // 3. Recover vaultId + winnerEmail from KV
-  const kvRecord = await env.REPLY_KV?.get(`winner:${paymentId}`)
+  const kvRecord = await env.ALIASES?.get(`winner:${paymentId}`)
   if (!kvRecord) {
     console.log(`[gateway] DROP outbound — no KV record for ${paymentId.slice(0, 12)}…`)
     message.setReject('Cannot resolve winner address')
@@ -268,7 +261,8 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
     message.setReject('Gateway error: vault unavailable')
     return
   }
-
+  const outboundFrom = vaultFields.gateway_email // e.g. alice@attention.email
+  
   // 5. Anti-spoof: decrypt vault's stored seller email and confirm From: matches
   const encryptedPayload = extractEncryptedEmailPayload(vaultFields)
   const sellerRealEmail  = await decryptSellerEmail(env, encryptedPayload)
@@ -285,15 +279,6 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
     return
   }
 
-  // 6. Verify [attn:SIG]
-  const signMessage    = buildSignMessage(vaultId, paymentId)
-  const { ok, reason } = await verifyAttentionToken(subject, signMessage, null)
-
-  if (!ok) {
-    console.log(`[gateway] DROP outbound — bad signature from ${from}: ${reason}`)
-    message.setReject('Invalid attention token on reply')
-    return
-  }
 
   // 7. Confirm thread not closed on-chain
   const closed = await isThreadClosed(rpc, vaultFields, paymentId)
@@ -318,8 +303,7 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
   console.log(`[gateway] ✓ Seller reply → ${winnerEmail}`)
   // Use the reply address the seller responded to as the From —
   // it is already authorised under the reply subdomain wildcard.
-  const outboundFrom = `${paymentId}@${replySubdomain}`
-  await sendWithFooter(message, winnerEmail, cleanSubject(subject), null, footer, env, outboundFrom)
+  await sendWithFooter(message, winnerEmail, subject, null, footer, env, outboundFrom)
 }
 
 // ── Send helper ───────────────────────────────────────────────────────────────
@@ -368,11 +352,9 @@ async function sendWithFooter(message, toAddress, subject, replyTo, footer, env,
  * Falls back to everything after the header block.
  */
 function extractTextBody(raw) {
-  // Split headers from body on the first blank line
   const blankLine = raw.indexOf('\r\n\r\n')
   const body = blankLine >= 0 ? raw.slice(blankLine + 4) : raw
 
-  // Detect multipart boundary
   const boundaryMatch = raw.match(/Content-Type:\s*multipart\/[^;]+;\s*boundary="?([^"\r\n]+)"?/i)
   if (boundaryMatch) {
     const boundary = '--' + boundaryMatch[1].trim()
@@ -380,14 +362,34 @@ function extractTextBody(raw) {
     for (const part of parts) {
       if (/Content-Type:\s*text\/plain/i.test(part)) {
         const partBlank = part.indexOf('\r\n\r\n')
-        return partBlank >= 0
+        const partBody = partBlank >= 0
           ? part.slice(partBlank + 4).replace(/--$/, '').trim()
           : part.trim()
+        return decodeCTE(part, partBody)
       }
     }
   }
 
-  return body.trim()
+  return decodeCTE(raw, body.trim())
+}
+
+function decodeCTE(headers, body) {
+  const cteMatch = headers.match(/Content-Transfer-Encoding:\s*(\S+)/i)
+  const cte = cteMatch?.[1].toLowerCase().trim()
+
+  if (cte === 'base64') {
+    try {
+      return atob(body.replace(/\s+/g, ''))
+    } catch {
+      return body
+    }
+  }
+  if (cte === 'quoted-printable') {
+    return body
+      .replace(/=\r?\n/g, '')           // soft line breaks
+      .replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+  }
+  return body
 }
 
 /** Wraps plain-text body + footer in minimal HTML. */
@@ -414,14 +416,9 @@ export function buildReplyAddress(paymentId, vaultId, replySubdomain) {
 function parseReplyAddress(to, replySubdomain) {
   const lower = to.toLowerCase().trim()
   if (!lower.endsWith(`@${replySubdomain}`)) return null
-  const local = lower.split('@')[0]
-  const dot   = local.indexOf('.')
-  if (dot < 0) return null
-  const paymentId  = local.slice(0, dot)
-  const vaultIdHex = local.slice(dot + 1)
-  if (!/^[0-9a-f]{64}$/.test(paymentId))  return null
-  if (!/^[0-9a-f]{64}$/.test(vaultIdHex)) return null
-  return { paymentId, vaultId: '0x' + vaultIdHex }
+  const paymentId = lower.split('@')[0]
+  if (!/^[0-9a-f]{64}$/.test(paymentId)) return null
+  return { paymentId }
 }
 
 // ── Footer builders ───────────────────────────────────────────────────────────
