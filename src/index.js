@@ -50,12 +50,15 @@
 //
 //   1. Detect In-Reply-To or References header → outbound flow.
 //   2. Extract paymentId from To: local-part.
-//   3. Look up winner's address from on-chain SlotWon events by paymentId.
+//   3. Look up winner's address from KV by paymentId.
 //   4. Decrypt vault's seller email, confirm From: matches (anti-spoof).
-//   5. Verify [attn:SIG] signature (seller proves wallet ownership).
-//   6. Confirm thread not closed on-chain.
-//   7. Send to winner, appending paymentId footer.
-//      Seller's real address is never disclosed to the winner.
+//   5. Confirm thread not closed on-chain.
+//   6. Send to winner. Seller's real address is never disclosed to the winner.
+//
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+//
+//   Inbound:  1 email per winner per hour, keyed by paymentId (= vaultId + winner).
+//   Outbound: 1 email per seller per winner per hour, keyed by paymentId.
 //
 // ── Env vars ──────────────────────────────────────────────────────────────────
 //
@@ -66,7 +69,6 @@
 //   PRIVATE_KEY           Base64-encoded raw P-256 private key (32 bytes) for email decryption
 //   GATEWAY_DOMAIN        e.g. "attention.email"   (default: "attention.email")
 //   REPLY_SUBDOMAIN       e.g. "reply.attention.email" (default: "reply.<GATEWAY_DOMAIN>")
-//   GATEWAY_FROM          Sender address for outgoing mail (default: noreply@<GATEWAY_DOMAIN>)
 
 import {
   makeClients,
@@ -87,6 +89,8 @@ import {
   buildSignMessage,
   isReplyMessage,
 } from './verify.js'
+
+const RATE_LIMIT_TTL = 60 * 60 // 1 hour in seconds
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 
@@ -133,6 +137,19 @@ export default {
     console.log(`[gateway] DROP — To: ${to} is not a recognised gateway address`)
     message.setReject('Unknown recipient')
   },
+}
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the action is allowed, false if rate limited.
+ * Uses a KV key with a 1-hour TTL. First write = allowed; key present = blocked.
+ */
+async function checkRateLimit(kv, key) {
+  const existing = await kv.get(key)
+  if (existing !== null) return false
+  await kv.put(key, '1', { expirationTtl: RATE_LIMIT_TTL })
+  return true
 }
 
 // ── Inbound: winner → seller ──────────────────────────────────────────────────
@@ -204,7 +221,16 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
     return
   }
 
-  // 9. Decrypt seller's real email from the on-chain encrypted blob
+  // 9. Rate limit: 1 inbound per winner per vault per hour
+  const rateLimitKey = `rate:inbound:${paymentId}`
+  const allowed = await checkRateLimit(env.ALIASES, rateLimitKey)
+  if (!allowed) {
+    console.log(`[gateway] DROP inbound — rate limited for paymentId ${paymentId.slice(0, 12)}…`)
+    message.setReject('Rate limit exceeded: please wait before sending another message')
+    return
+  }
+
+  // 10. Decrypt seller's real email from the on-chain encrypted blob
   const encryptedPayload = extractEncryptedEmailPayload(vaultFields)
   const sellerRealEmail  = await decryptSellerEmail(env, encryptedPayload)
   if (!sellerRealEmail) {
@@ -213,30 +239,26 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
     return
   }
 
-  // 10. Store winner → paymentId mapping in KV for reply routing
-  if (env.ALIASES) {
-    await env.ALIASES.put(
-      `winner:${paymentId}`,
-      JSON.stringify({ email: from, vaultId,subject: subject }),
-      { expirationTtl: 60 * 60 * 24 * 90 }
-    )
-  }
+  // 11. Store winner → paymentId mapping in KV for reply routing
+  await env.ALIASES.put(
+    `winner:${paymentId}`,
+    JSON.stringify({ email: from, vaultId, subject }),
+    { expirationTtl: 60 * 60 * 24 * 90 }
+  )
 
-  // 11. Send to seller
+  // 12. Send to seller
   const replyTo = `${paymentId}@${replySubdomain}`
   const footer  = buildInboundFooter({ paymentId, vaultId, senderEmail: from })
 
   console.log(`[gateway] ✓ Inbound verified from ${from} — sending to seller, reply-to ${replyTo}`)
-  // Use the address the winner wrote to (e.g. alice@attention.email) as the From —
-  // this matches the wildcard address authorised for sending on this domain.
-  await sendWithFooter(message, sellerRealEmail, subject, replyTo, footer, env, to)
+  await sendMessage(message, sellerRealEmail, subject, replyTo, footer, env, to)
 }
 
 // ── Outbound: seller → winner ─────────────────────────────────────────────────
 
 async function handleSellerReply({ message, from, to, subject, rpc, env, gatewayDomain, replySubdomain }) {
 
-  // 1. Parse paymentId + vaultId from the reply address
+  // 1. Parse paymentId from the reply address
   const parsedReply = parseReplyAddress(to, replySubdomain)
   if (!parsedReply) {
     console.log(`[gateway] DROP outbound — invalid reply address: ${to}`)
@@ -245,7 +267,7 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
   }
   const { paymentId } = parsedReply
 
-  // 3. Recover vaultId + winnerEmail from KV
+  // 2. Recover vaultId + winnerEmail from KV
   const kvRecord = await env.ALIASES?.get(`winner:${paymentId}`)
   if (!kvRecord) {
     console.log(`[gateway] DROP outbound — no KV record for ${paymentId.slice(0, 12)}…`)
@@ -254,16 +276,15 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
   }
   const { email: winnerEmail, vaultId } = JSON.parse(kvRecord)
 
-  // 4. Fetch vault fields
+  // 3. Fetch vault fields
   const vaultFields = await fetchVaultFieldsRpc(rpc, vaultId)
   if (!vaultFields) {
     console.error(`[gateway] Could not fetch vault ${vaultId}`)
     message.setReject('Gateway error: vault unavailable')
     return
   }
-  const outboundFrom = vaultFields.gateway_email // e.g. alice@attention.email
-  
-  // 5. Anti-spoof: decrypt vault's stored seller email and confirm From: matches
+
+  // 4. Anti-spoof: decrypt vault's stored seller email and confirm From: matches
   const encryptedPayload = extractEncryptedEmailPayload(vaultFields)
   const sellerRealEmail  = await decryptSellerEmail(env, encryptedPayload)
 
@@ -279,8 +300,7 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
     return
   }
 
-
-  // 7. Confirm thread not closed on-chain
+  // 5. Confirm thread not closed on-chain
   const closed = await isThreadClosed(rpc, vaultFields, paymentId)
   if (closed) {
     console.log(`[gateway] DROP outbound — thread closed for paymentId ${paymentId.slice(0, 12)}…`)
@@ -288,7 +308,7 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
     return
   }
 
-  // 8. Confirm SlotWon record still exists on-chain
+  // 6. Confirm SlotWon record still exists on-chain
   const slotMap    = await fetchSlotWonMap(rpc, env.PACKAGE_ID, vaultId)
   const slotRecord = slotMap[paymentId]
 
@@ -298,45 +318,51 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
     return
   }
 
-  // 9. Send to winner
-  const footer = buildOutboundFooter({ paymentId, vaultId })
+  // 7. Rate limit: 1 outbound per seller per winner per hour (keyed by paymentId)
+  const rateLimitKey = `rate:outbound:${paymentId}`
+  const allowed = await checkRateLimit(env.ALIASES, rateLimitKey)
+  if (!allowed) {
+    console.log(`[gateway] DROP outbound — rate limited for paymentId ${paymentId.slice(0, 12)}…`)
+    message.setReject('Rate limit exceeded: please wait before sending another message')
+    return
+  }
+
+  // 8. Send to winner
+  const outboundFrom = vaultFields.gateway_email
   console.log(`[gateway] ✓ Seller reply → ${winnerEmail}`)
-  // Use the reply address the seller responded to as the From —
-  // it is already authorised under the reply subdomain wildcard.
-  await sendWithFooter(message, winnerEmail, subject, null, footer, env, outboundFrom)
+  await sendMessage(message, winnerEmail, subject, null, null, env, outboundFrom)
 }
 
 // ── Send helper ───────────────────────────────────────────────────────────────
 
-async function sendWithFooter(message, toAddress, subject, replyTo, footer, env, fromAddress) {
+async function sendMessage(message, toAddress, subject, replyTo, footer, env, fromAddress) {
   try {
-
-    // Read and decode the raw message body
     const rawBody  = await new Response(message.raw).text()
     const bodyText = extractTextBody(rawBody)
 
     // Only X-* headers are allowed by Cloudflare's send API.
-    // Reply-To is a top-level field; threading headers are X-* prefixed.
     const extraHeaders = { 'X-Original-From': message.from }
     const inReplyTo  = message.headers.get('in-reply-to')
     const references = message.headers.get('references')
     const messageId  = message.headers.get('message-id')
-    if (inReplyTo)  extraHeaders['X-In-Reply-To']  = inReplyTo
-    if (references) extraHeaders['X-References']   = references
+    if (inReplyTo)  extraHeaders['X-In-Reply-To']         = inReplyTo
+    if (references) extraHeaders['X-References']          = references
     if (messageId)  extraHeaders['X-Original-Message-Id'] = messageId
+
+    const text = footer ? bodyText + '\n\n' + footer : bodyText
+    const html = buildHtml(bodyText, footer)
 
     const payload = {
       to:      toAddress,
       from:    fromAddress,
       subject,
-      text:    bodyText + '\n\n' + footer,
-      html:    buildHtml(bodyText, footer),
+      text,
+      html,
       headers: extraHeaders,
     }
     if (replyTo) payload.replyTo = replyTo
 
     await env.EMAIL.send(payload)
-
     console.log(`[gateway] Sent to ${toAddress}`)
   } catch (err) {
     console.error('[gateway] Send failed:', err)
@@ -346,11 +372,6 @@ async function sendWithFooter(message, toAddress, subject, replyTo, footer, env,
 
 // ── Body helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Extracts the plain-text portion from a raw RFC 5322 message.
- * For multipart messages it returns the first text/plain part.
- * Falls back to everything after the header block.
- */
 function extractTextBody(raw) {
   const blankLine = raw.indexOf('\r\n\r\n')
   const body = blankLine >= 0 ? raw.slice(blankLine + 4) : raw
@@ -386,13 +407,12 @@ function decodeCTE(headers, body) {
   }
   if (cte === 'quoted-printable') {
     return body
-      .replace(/=\r?\n/g, '')           // soft line breaks
+      .replace(/=\r?\n/g, '')
       .replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
   }
   return body
 }
 
-/** Wraps plain-text body + footer in minimal HTML. */
 function buildHtml(bodyText, footer) {
   const esc = s =>
     s.replace(/&/g, '&amp;')
@@ -402,16 +422,12 @@ function buildHtml(bodyText, footer) {
 
   return `<!DOCTYPE html><html><body>
 <div style="font-family:sans-serif;font-size:14px;line-height:1.6">${esc(bodyText)}</div>
-<hr style="margin:24px 0;border:none;border-top:1px solid #ddd">
-<pre style="font-size:12px;color:#888;white-space:pre-wrap">${esc(footer)}</pre>
+${footer ? `<hr style="margin:24px 0;border:none;border-top:1px solid #ddd">
+<pre style="font-size:12px;color:#888;white-space:pre-wrap">${esc(footer)}</pre>` : ''}
 </body></html>`
 }
 
-// ── Reply address encoding / decoding ────────────────────────────────────────
-
-export function buildReplyAddress(paymentId, vaultId, replySubdomain) {
-  return `${paymentId}.${vaultId}@${replySubdomain}`
-}
+// ── Reply address parsing ─────────────────────────────────────────────────────
 
 function parseReplyAddress(to, replySubdomain) {
   const lower = to.toLowerCase().trim()
@@ -426,19 +442,9 @@ function parseReplyAddress(to, replySubdomain) {
 function buildInboundFooter({ paymentId, vaultId, senderEmail }) {
   return [
     '--- AttentionMarket ---',
-    `Sender:    ${senderEmail}`,
     `PaymentID: ${paymentId}`,
     `VaultID:   ${vaultId}`,
     'To close: call close_conversation(vaultId, paymentId) on-chain.',
-    '-----------------------',
-  ].join('\n')
-}
-
-function buildOutboundFooter({ paymentId, vaultId }) {
-  return [
-    '--- AttentionMarket ---',
-    `PaymentID: ${paymentId}`,
-    `VaultID:   ${vaultId}`,
     '-----------------------',
   ].join('\n')
 }
