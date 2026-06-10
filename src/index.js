@@ -96,8 +96,8 @@ const RATE_LIMIT_TTL = 60 * 60 // 1 hour in seconds
 
 export default {
   async email(message, env, _ctx) {
-    const from    = message.from.toLowerCase().trim()
-    const to      = message.to.toLowerCase().trim()
+    const from = message.from.toLowerCase().trim()
+    const to = message.to.toLowerCase().trim()
     const subject = message.headers.get('subject') || ''
     const headers = message.headers
 
@@ -111,7 +111,7 @@ export default {
       return
     }
 
-    const gatewayDomain  = (env.GATEWAY_DOMAIN || 'attention.email').toLowerCase()
+    const gatewayDomain = (env.GATEWAY_DOMAIN || 'attention.email').toLowerCase()
     const replySubdomain = (env.REPLY_SUBDOMAIN || `reply.${gatewayDomain}`).toLowerCase()
 
     // ── Route: seller reply ───────────────────────────────────────────────────
@@ -164,7 +164,7 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
   }
 
   // 2. Resolve vault from To: local-part (e.g. "alice" → vaultId)
-  const localPart    = to.split('@')[0]
+  const localPart = to.split('@')[0]
   const gatewayEmail = `${localPart}@${gatewayDomain}`
 
   const vaultId = await vaultIdByGatewayEmail(rpc, env.REGISTRY_ID, gatewayEmail)
@@ -187,7 +187,7 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
   const paymentId = await computePaymentId(from, vaultId)
 
   // 5. Look up the SlotWon event record for this paymentId
-  const slotMap    = await fetchSlotWonMap(rpc, env.PACKAGE_ID, vaultId)
+  const slotMap = await fetchSlotWonMap(rpc, env.PACKAGE_ID, vaultId)
   const slotRecord = slotMap[paymentId]
 
   if (!slotRecord) {
@@ -204,7 +204,7 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
   }
 
   // 7. Verify the Ed25519 wallet signature against the on-chain bidder address
-  const signMessage    = buildSignMessage(vaultId, paymentId)
+  const signMessage = buildSignMessage(vaultId, paymentId)
   const { ok, reason } = await verifyAttentionToken(subject, signMessage, slotRecord.bidderAddress)
 
   if (!ok) {
@@ -232,10 +232,42 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
 
   // 10. Decrypt seller's real email from the on-chain encrypted blob
   const encryptedPayload = extractEncryptedEmailPayload(vaultFields)
-  const sellerRealEmail  = await decryptSellerEmail(env, encryptedPayload)
+  const sellerRealEmail = await decryptSellerEmail(env, encryptedPayload)
   if (!sellerRealEmail) {
     console.error('[gateway] Could not decrypt seller email')
     message.setReject('Gateway error: could not resolve seller')
+    return
+  }
+
+  // 10b. Confirm winner's email is verified and not blocked
+  const [winnerVerified, winnerBlocked] = await Promise.all([
+    env.ALIASES.get(`verify_email:${from}`, { type: 'json' }),
+    env.ALIASES.get(`blocked_email:${from}`),
+  ])
+  if (winnerBlocked) {
+    console.log(`[gateway] DROP inbound — sender ${from} is blocked`)
+    message.setReject('Sender address is blocked')
+    return
+  }
+  if (!winnerVerified?.verified) {
+    console.log(`[gateway] DROP inbound — sender ${from} is not verified`)
+    message.setReject('Sender address is not verified')
+    return
+  }
+
+  // 10c. Confirm seller's email is verified and not blocked
+  const [sellerVerified, sellerBlocked] = await Promise.all([
+    env.ALIASES.get(`verify_email:${sellerRealEmail.toLowerCase().trim()}`, { type: 'json' }),
+    env.ALIASES.get(`blocked_email:${sellerRealEmail.toLowerCase().trim()}`),
+  ])
+  if (sellerBlocked) {
+    console.log(`[gateway] DROP inbound — seller ${sellerRealEmail} is blocked`)
+    message.setReject('Seller address is blocked')
+    return
+  }
+  if (!sellerVerified?.verified) {
+    console.log(`[gateway] DROP inbound — seller ${sellerRealEmail} is not verified`)
+    message.setReject('Seller address is not verified')
     return
   }
 
@@ -248,7 +280,7 @@ async function handleInbound({ message, from, to, subject, rpc, env, gatewayDoma
 
   // 12. Send to seller
   const replyTo = `${paymentId}@${replySubdomain}`
-  const footer  = buildInboundFooter({ paymentId, vaultId, senderEmail: from })
+  const footer = buildInboundFooter({ paymentId, vaultId, senderEmail: from })
 
   console.log(`[gateway] ✓ Inbound verified from ${from} — sending to seller, reply-to ${replyTo}`)
   await sendMessage(message, sellerRealEmail, subject, replyTo, footer, env, to)
@@ -286,7 +318,7 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
 
   // 4. Anti-spoof: decrypt vault's stored seller email and confirm From: matches
   const encryptedPayload = extractEncryptedEmailPayload(vaultFields)
-  const sellerRealEmail  = await decryptSellerEmail(env, encryptedPayload)
+  const sellerRealEmail = await decryptSellerEmail(env, encryptedPayload)
 
   if (!sellerRealEmail) {
     console.error('[gateway] Could not decrypt seller email for outbound verification')
@@ -300,6 +332,38 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
     return
   }
 
+  // 4b. Confirm winner's email is verified and not blocked before forwarding to them
+  const [winnerVerified, winnerBlocked] = await Promise.all([
+    env.ALIASES.get(`verify_email:${winnerEmail}`, { type: 'json' }),
+    env.ALIASES.get(`blocked_email:${winnerEmail}`),
+  ])
+  if (winnerBlocked) {
+    console.log(`[gateway] DROP outbound — winner ${winnerEmail} is blocked`)
+    message.setReject('Recipient address is blocked')
+    return
+  }
+  if (!winnerVerified?.verified) {
+    console.log(`[gateway] DROP outbound — winner ${winnerEmail} is not verified`)
+    message.setReject('Recipient address is not verified')
+    return
+  }
+
+  // 4c. Confirm seller's email is verified and not blocked
+  const [sellerVerified, sellerBlocked] = await Promise.all([
+    env.ALIASES.get(`verify_email:${from}`, { type: 'json' }),
+    env.ALIASES.get(`blocked_email:${from}`),
+  ])
+  if (sellerBlocked) {
+    console.log(`[gateway] DROP outbound — seller ${from} is blocked`)
+    message.setReject('Sender address is blocked')
+    return
+  }
+  if (!sellerVerified?.verified) {
+    console.log(`[gateway] DROP outbound — seller ${from} is not verified`)
+    message.setReject('Sender address is not verified')
+    return
+  }
+
   // 5. Confirm thread not closed on-chain
   const closed = await isThreadClosed(rpc, vaultFields, paymentId)
   if (closed) {
@@ -309,7 +373,7 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
   }
 
   // 6. Confirm SlotWon record still exists on-chain
-  const slotMap    = await fetchSlotWonMap(rpc, env.PACKAGE_ID, vaultId)
+  const slotMap = await fetchSlotWonMap(rpc, env.PACKAGE_ID, vaultId)
   const slotRecord = slotMap[paymentId]
 
   if (!slotRecord) {
@@ -337,24 +401,24 @@ async function handleSellerReply({ message, from, to, subject, rpc, env, gateway
 
 async function sendMessage(message, toAddress, subject, replyTo, footer, env, fromAddress) {
   try {
-    const rawBody  = await new Response(message.raw).text()
+    const rawBody = await new Response(message.raw).text()
     const bodyText = extractTextBody(rawBody)
 
     // Only X-* headers are allowed by Cloudflare's send API.
     const extraHeaders = { 'X-Original-From': message.from }
-    const inReplyTo  = message.headers.get('in-reply-to')
+    const inReplyTo = message.headers.get('in-reply-to')
     const references = message.headers.get('references')
-    const messageId  = message.headers.get('message-id')
-    if (inReplyTo)  extraHeaders['X-In-Reply-To']         = inReplyTo
-    if (references) extraHeaders['X-References']          = references
-    if (messageId)  extraHeaders['X-Original-Message-Id'] = messageId
+    const messageId = message.headers.get('message-id')
+    if (inReplyTo) extraHeaders['X-In-Reply-To'] = inReplyTo
+    if (references) extraHeaders['X-References'] = references
+    if (messageId) extraHeaders['X-Original-Message-Id'] = messageId
 
     const text = footer ? bodyText + '\n\n' + footer : bodyText
     const html = buildHtml(bodyText, footer)
 
     const payload = {
-      to:      toAddress,
-      from:    fromAddress,
+      to: toAddress,
+      from: fromAddress,
       subject,
       text,
       html,
@@ -416,9 +480,9 @@ function decodeCTE(headers, body) {
 function buildHtml(bodyText, footer) {
   const esc = s =>
     s.replace(/&/g, '&amp;')
-     .replace(/</g, '&lt;')
-     .replace(/>/g, '&gt;')
-     .replace(/\n/g, '<br>\n')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>\n')
 
   return `<!DOCTYPE html><html><body>
 <div style="font-family:sans-serif;font-size:14px;line-height:1.6">${esc(bodyText)}</div>
